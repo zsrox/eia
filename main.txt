@@ -1,0 +1,160 @@
+<dependencies>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-integration</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.integration</groupId>
+        <artifactId>spring-integration-http</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+</dependencies>
+
+@Configuration
+@EnableIntegration
+public class IntegrationConfig {
+
+    @Value("${polling.uri}")
+    private String pollingUri;
+
+    @Bean
+    public PollableChannel inputChannel() {
+        return new QueueChannel();
+    }
+
+    @Bean
+    public IntegrationFlow pollingFlow() {
+        return IntegrationFlows.from(() -> "trigger",
+                e -> e.poller(Pollers.fixedDelay(45000)
+                        .taskExecutor(taskExecutor())))
+            .handle(Http.outboundGateway(pollingUri + "?offsetId={offsetId}",
+                    restTemplate())
+                    .httpMethod(HttpMethod.GET)
+                    .uriVariable("offsetId", this::getOffsetId)
+                    .expectedResponseType(String.class))
+            .channel(inputChannel())
+            .get();
+    }
+
+    private long getOffsetId() {
+        // Logic to manage and increment the offsetId
+        return 100;  // Starting with 100 for example
+    }
+
+    @Bean
+    public IntegrationFlow processFlow() {
+        return IntegrationFlows.from(inputChannel())
+            .split()  // Split based on JSON content
+            .aggregate(a -> a.correlationStrategy(new HeaderAttributeCorrelationStrategy("TxSeqNo"))
+                            .releaseStrategy(new SequenceSizeReleaseStrategy("TxGroupCount")))
+            .handle("messageProcessor", "process")
+            .get();
+    }
+
+    @Bean
+    public TaskExecutor taskExecutor() {
+        return new ConcurrentTaskExecutor();
+    }
+
+    @Bean
+    public RestTemplate restTemplate() {
+        return new RestTemplate();
+    }
+}
+
+@Component
+public class MessageProcessor {
+    public void process(Message<?> message) {
+        // Processing logic
+        System.out.println("Processed: " + message);
+    }
+}
+
+///
+@Bean
+public IntegrationFlow processFlow(MessageStore messageStore, AtomicInteger lastProcessedTxSeqNo) {
+    return IntegrationFlows.from(inputChannel())
+        .split()  // Assuming a splitter that properly handles incoming data
+        .aggregate(aggregatorSpec -> aggregatorSpec
+            .correlationStrategy(message -> message.getHeaders().get("TxSeqNo"))
+            .releaseStrategy(group -> isReadyToProcess(group, lastProcessedTxSeqNo))
+            .messageStore(messageStore)
+            .groupTimeout(30000)  // Optional: Consider a timeout for long-waiting groups
+            .expireGroupsUponCompletion(true))
+        .handle(message -> {
+            processMessage(message);
+            lastProcessedTxSeqNo.set((Integer) message.getHeaders().get("TxSeqNo")); // Update last processed
+            triggerNextAvailableMessage(messageStore, lastProcessedTxSeqNo);
+        })
+        .get();
+}
+
+private boolean isReadyToProcess(MessageGroup group, AtomicInteger lastProcessedTxSeqNo) {
+    Integer groupTxSeqNo = (Integer) group.getOne().getHeaders().get("TxSeqNo");
+    return groupTxSeqNo == lastProcessedTxSeqNo.get() + 1;
+}
+
+private void triggerNextAvailableMessage(MessageStore messageStore, AtomicInteger lastProcessedTxSeqNo) {
+    MessageGroup nextGroup = messageStore.getMessageGroup(lastProcessedTxSeqNo.get() + 1);
+    if (nextGroup != null && nextGroup.size() == (Integer) nextGroup.getOne().getHeaders().get("TxGroupCount")) {
+        // Assuming that a complete group is ready to be processed
+        // This is a conceptual implementation; actual implementation might require more handling
+        inputChannel().send(new GenericMessage<>(nextGroup.getMessages()));
+    }
+}
+///
+@Configuration
+@EnableIntegration
+public class IntegrationConfig {
+
+    @Autowired
+    private MessageStore messageStore;
+
+    private final Set<Integer> processedTxSeqNos = Collections.synchronizedSet(new HashSet<>());
+
+    @Bean
+    public IntegrationFlow processFlow() {
+        return IntegrationFlows.from(inputChannel())
+            .split()
+            .aggregate(aggregatorSpec -> aggregatorSpec
+                .correlationStrategy(message -> message.getHeaders().get("TxSeqNo"))
+                .releaseStrategy(group -> isReadyToProcess(group))
+                .messageStore(messageStore)
+                .expireGroupsUponCompletion(true))
+            .handle(this::handleMessage)
+            .get();
+    }
+
+    private boolean isReadyToProcess(MessageGroup group) {
+        Integer groupTxSeqNo = (Integer) group.getOne().getHeaders().get("TxSeqNo");
+        if (processedTxSeqNos.contains(groupTxSeqNo)) {
+            handleDuplicateOrStaleMessage(group);
+            return false;
+        }
+        return true;
+    }
+
+    private void handleMessage(Message<?> message) {
+        Integer txSeqNo = (Integer) message.getHeaders().get("TxSeqNo");
+        if (!processedTxSeqNos.contains(txSeqNo)) {
+            processedTxSeqNos.add(txSeqNo);
+            processMessage(message);  // Your business logic for processing the message
+        } else {
+            handleDuplicateOrStaleMessage(message);
+        }
+    }
+
+    private void handleDuplicateOrStaleMessage(Object message) {
+        // Log the error or handle it according to your application's needs
+        LOG.error("Duplicate or stale message detected: {}", message);
+    }
+
+    @Bean
+    public MessageChannel inputChannel() {
+        return new QueueChannel();
+    }
+}
+///
